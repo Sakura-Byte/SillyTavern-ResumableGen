@@ -401,8 +401,9 @@ async function checkForRecoverableJobs() {
         if (dryRun) return;
         lastGeneration = { type: type ?? 'normal', quiet: type === 'quiet' && !options?.quietToLoud };
     });
+    const pluginCheck = checkServerPlugin();
     eventSource.on(eventTypes.APP_READY, async () => {
-        await checkServerPlugin();
+        await pluginCheck;
         setTimeout(checkForRecoverableJobs, 1500);
     });
     eventSource.on(eventTypes.CHAT_CHANGED, () => setTimeout(checkForRecoverableJobs, 1500));
