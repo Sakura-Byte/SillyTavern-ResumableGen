@@ -52,6 +52,8 @@ class Job extends EventEmitter {
         /** @type {Buffer[]} */
         this.chunks = [];
         this.size = 0;
+        /** @type {Array<[number, number]>} [end byte offset, ms since job creation] for each received chunk */
+        this.timeline = [];
         this.done = false;
         this.cancelled = false;
         this.error = '';
@@ -72,6 +74,7 @@ class Job extends EventEmitter {
     push(chunk) {
         this.chunks.push(chunk);
         this.size += chunk.length;
+        this.timeline.push([this.size, Date.now() - this.createdAt]);
         this.emit('data', chunk);
     }
 
@@ -98,8 +101,9 @@ class Job extends EventEmitter {
         return Buffer.concat(this.chunks).subarray(offset);
     }
 
-    toJSON() {
+    toJSON(withTimeline = false) {
         return {
+            ...(withTimeline ? { timeline: this.timeline } : {}),
             id: this.id,
             target: this.target,
             meta: this.meta,
@@ -313,7 +317,7 @@ async function init(router) {
     });
     router.get('/jobs/:id', (req, res) => {
         const job = getJob(req, res);
-        if (job) res.json(job.toJSON());
+        if (job) res.json(job.toJSON(req.query.timeline === '1'));
     });
     router.get('/jobs/:id/stream', streamJob);
     router.post('/jobs/:id/cancel', cancelJob);

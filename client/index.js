@@ -27,6 +27,25 @@ const originalFetch = window.fetch.bind(window);
 let pluginAvailable = true;
 let lastGeneration = { type: 'normal', quiet: false };
 
+/**
+ * Jobs started by this page.
+ * @typedef {object} PageJob
+ * @property {string} id Job ID
+ * @property {number} clientStart Client time right before the job was started
+ * @property {Array<[number, number]>} recv [client time, bytes received so far] for each chunk the client received
+ * @property {HeadersInit} headers Request headers
+ * @property {boolean} acked Whether the job was acknowledged to the server
+ * @type {PageJob[]}
+ */
+const pageJobs = [];
+
+/** Tells the server this page has handled the job, so it isn't offered for recovery. */
+function ackJob(job) {
+    if (job.acked) return;
+    job.acked = true;
+    originalFetch(`${BASE}/jobs/${job.id}/ack`, { method: 'POST', headers: job.headers }).catch(() => { });
+}
+
 class FatalJobError extends Error { }
 
 function abortError() {
@@ -81,6 +100,9 @@ async function resumableFetch(input, init, target) {
     if (signal?.aborted) throw abortError();
 
     const headers = init.headers;
+    const clientStart = Date.now();
+    /** @type {Array<[number, number]>} */
+    const recv = [];
     const wrapped = `{"target":${JSON.stringify(target)},"meta":${JSON.stringify(getMeta())},"payload":${init.body}}`;
     const startResponse = await originalFetch(`${BASE}/start`, { method: 'POST', headers, body: wrapped, signal });
 
@@ -95,15 +117,21 @@ async function resumableFetch(input, init, target) {
     }
 
     const { id } = await startResponse.json();
+    /** @type {PageJob} */
+    const pageJob = { id, clientStart, recv, headers, acked: false };
+    pageJobs.push(pageJob);
+    pageJobs.splice(0, Math.max(0, pageJobs.length - 20));
     let received = 0;
     let finished = false;
     /** @type {AbortController|null} */
     let attachController = null;
 
-    const ack = () => originalFetch(`${BASE}/jobs/${id}/ack`, { method: 'POST', headers }).catch(() => { });
     const onAbort = () => {
         attachController?.abort();
-        if (!finished) originalFetch(`${BASE}/jobs/${id}/cancel`, { method: 'POST', headers }).catch(() => { });
+        if (!finished) {
+            pageJob.acked = true; // Cancelling acknowledges it server-side
+            originalFetch(`${BASE}/jobs/${id}/cancel`, { method: 'POST', headers }).catch(() => { });
+        }
     };
     signal?.addEventListener('abort', onAbort, { once: true });
 
@@ -156,6 +184,7 @@ async function resumableFetch(input, init, target) {
                     const { done, value } = await reader.read();
                     if (!done) {
                         received += value.byteLength;
+                        recv.push([Date.now(), received]);
                         controller.enqueue(value);
                         return;
                     }
@@ -163,7 +192,7 @@ async function resumableFetch(input, init, target) {
                     if (await isComplete()) {
                         finished = true;
                         signal?.removeEventListener('abort', onAbort);
-                        ack();
+                        ackJob(pageJob);
                         controller.close();
                         return;
                     }
@@ -203,6 +232,104 @@ window.fetch = async function (input, init) {
     }
     return target ? resumableFetch(input, init, target) : originalFetch(input, init);
 };
+
+// ---------------------------------------------------------------------------
+// Generation timer correction
+// ---------------------------------------------------------------------------
+// SillyTavern times generations with the browser's wall clock. When the page was suspended and the stream resumed
+// later, everything received after the resume gets the resume time. We map each client-side moment back to the byte
+// offset received by then, and that offset to the time the server actually received it.
+
+/** Minimum discrepancy (ms) before a timer gets corrected; smaller differences are just network latency. */
+const TIMER_CORRECTION_THRESHOLD = 1000;
+
+/**
+ * Converts a client time into the corresponding "true" client time, based on when the server received the data
+ * that the client had received by then.
+ * @param {PageJob} job
+ * @param {Array<[number, number]>} timeline [end byte offset, ms since job start] for each chunk the server received
+ * @param {number} clientTime
+ * @returns {number}
+ */
+function toTrueTime(job, timeline, clientTime) {
+    let offset = job.recv[0]?.[1] ?? 0;
+    for (const [time, bytes] of job.recv) {
+        if (time > clientTime) break;
+        offset = bytes;
+    }
+    const entry = timeline.find(([end]) => end >= offset) ?? timeline[timeline.length - 1];
+    return job.clientStart + (entry?.[1] ?? 0);
+}
+
+/** Same output as SillyTavern's formatGenerationTimer (not exported). */
+function formatTimer(started, finished, tokenCount, reasoningDuration, timeToFirstToken) {
+    const dateFormat = 'HH:mm:ss D MMM YYYY';
+    const start = moment(started);
+    const finish = moment(finished);
+    const seconds = finish.diff(start, 'seconds', true);
+    const value = `${seconds.toFixed(1)}s`;
+    const title = [
+        `Generation queued: ${start.format(dateFormat)}`,
+        `Reply received: ${finish.format(dateFormat)}`,
+        `Time to generate: ${seconds} seconds`,
+        timeToFirstToken ? `Time to first token: ${timeToFirstToken / 1000} seconds` : '',
+        reasoningDuration > 0 ? `Time to think: ${reasoningDuration / 1000} seconds` : '',
+        tokenCount > 0 ? `Token rate: ${Number(tokenCount / seconds).toFixed(3)} t/s` : '',
+    ].filter(x => x).join('\n').trim();
+    return { value, title };
+}
+
+async function correctGenerationTimer(messageId) {
+    const context = SillyTavern.getContext();
+    const message = context.chat[messageId];
+    if (!message || message.is_user || !message.gen_started || !message.gen_finished) return;
+
+    const started = new Date(message.gen_started).getTime();
+    const finished = new Date(message.gen_finished).getTime();
+    // The last job started during this generation (tool calls can produce several; the last one ends it).
+    const job = pageJobs.findLast(j => j.clientStart >= started - 1000 && j.clientStart <= finished && j.recv.length > 0);
+    if (!job) return;
+
+    const response = await originalFetch(`${BASE}/jobs/${job.id}?timeline=1`, { headers: job.headers, cache: 'no-store' });
+    if (!response.ok) return;
+    const { timeline } = await response.json();
+    if (!Array.isArray(timeline) || timeline.length === 0) return;
+
+    // Time between the last received chunk and the message being finalized is local processing, keep it.
+    const lastRecv = Math.min(finished, job.recv[job.recv.length - 1][0]);
+    const trueFinished = toTrueTime(job, timeline, lastRecv) + (finished - lastRecv);
+    if (finished - trueFinished < TIMER_CORRECTION_THRESHOLD) return;
+
+    const extra = message.extra ?? (message.extra = {});
+    message.gen_finished = new Date(trueFinished);
+
+    if (extra.time_to_first_token > 0) {
+        const trueFirst = toTrueTime(job, timeline, started + extra.time_to_first_token) - started;
+        if (trueFirst >= 0 && trueFirst < extra.time_to_first_token) extra.time_to_first_token = trueFirst;
+    }
+    if (extra.reasoning_duration > 0) {
+        const trueReasoning = toTrueTime(job, timeline, started + extra.reasoning_duration) - started;
+        if (trueReasoning >= 0 && trueReasoning < extra.reasoning_duration) extra.reasoning_duration = trueReasoning;
+    }
+
+    const swipeInfo = message.swipe_info?.[message.swipe_id ?? 0];
+    if (swipeInfo) {
+        swipeInfo.gen_finished = message.gen_finished;
+        swipeInfo.extra = { ...(swipeInfo.extra ?? {}), time_to_first_token: extra.time_to_first_token, reasoning_duration: extra.reasoning_duration };
+    }
+
+    const element = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
+    const timer = element?.querySelector('.mes_timer');
+    if (timer) {
+        const { value, title } = formatTimer(message.gen_started, message.gen_finished, extra.token_count, extra.reasoning_duration, extra.time_to_first_token);
+        timer.textContent = value;
+        timer.setAttribute('title', title);
+    }
+    if (element && extra.reasoning_duration > 0) {
+        context.updateMessageBlock(messageId, message, { rerenderMessage: false });
+    }
+    console.info(`[resumable-gen] Corrected generation timer of message ${messageId}: ${((finished - started) / 1000).toFixed(1)}s -> ${((trueFinished - started) / 1000).toFixed(1)}s`);
+}
 
 // ---------------------------------------------------------------------------
 // Server plugin check
@@ -397,6 +524,16 @@ async function checkForRecoverableJobs() {
 
 (function initResumableGeneration() {
     const { eventSource, eventTypes } = SillyTavern.getContext();
+    eventSource.on(eventTypes.MESSAGE_RECEIVED, async (messageId) => {
+        try {
+            await correctGenerationTimer(Number(messageId));
+        } catch (error) {
+            console.warn('[resumable-gen] Timer correction failed', error);
+        }
+    });
+    // SillyTavern may stop reading a stream at [DONE] before it technically ends, so acknowledge everything this
+    // page started once a generation is over. The page is alive and has handled them.
+    eventSource.on(eventTypes.GENERATION_ENDED, () => pageJobs.forEach(ackJob));
     eventSource.on(eventTypes.GENERATION_STARTED, (type, options, dryRun) => {
         if (dryRun) return;
         lastGeneration = { type: type ?? 'normal', quiet: type === 'quiet' && !options?.quietToLoud };

@@ -1,6 +1,6 @@
 {
     "name": "sillytavern-resumable-gen",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "Keeps SillyTavern generation requests running on the server so clients can reconnect after the browser connection drops (e.g. iOS backgrounding).",
     "main": "server/index.cjs",
     "license": "AGPL-3.0",
