@@ -1,0 +1,10 @@
+{
+    "display_name": "Resumable Generation",
+    "loading_order": 1,
+    "requires": [],
+    "optional": [],
+    "js": "client/index.js",
+    "author": "Sakura-Byte",
+    "version": "1.0.0",
+    "homePage": "https://github.com/Sakura-Byte/SillyTavern-ResumableGen"
+}
