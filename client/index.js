@@ -29,6 +29,9 @@ let pluginAvailable = true;
 let lastGeneration = { type: 'normal', quiet: false };
 
 const DEFAULT_SETTINGS = Object.freeze({
+    general: {
+        stopOnClose: false,
+    },
     retry: {
         enabled: false,
         maxRetries: 3,
@@ -41,9 +44,33 @@ const DEFAULT_SETTINGS = Object.freeze({
 function getSettings() {
     const { extensionSettings } = SillyTavern.getContext();
     const settings = extensionSettings[SETTINGS_KEY] ?? (extensionSettings[SETTINGS_KEY] = {});
+    settings.general = { ...DEFAULT_SETTINGS.general, ...(settings.general ?? {}) };
     settings.retry = { ...DEFAULT_SETTINGS.retry, ...(settings.retry ?? {}) };
     return settings;
 }
+
+// ---------------------------------------------------------------------------
+// Page closing
+// ---------------------------------------------------------------------------
+// SillyTavern stops the running stream when the page unloads. That must not cancel the job on the server: the user
+// may be switching devices (or iOS may have killed the page), and the result should stay recoverable. Only stopping
+// while the page stays open (the Stop button, /stop, ...) cancels the job, unless "stop on close" is enabled.
+
+let pageUnloading = false;
+
+function onPageUnloading() {
+    pageUnloading = true;
+    // If the unload gets cancelled (e.g. the "leave site?" prompt), the page carries on normally.
+    setTimeout(() => { pageUnloading = false; }, 10000);
+    if (getSettings().general.stopOnClose) {
+        pageJobs.forEach(job => cancelJob(job, { keepalive: true }));
+    }
+}
+
+// SillyTavern's own beforeunload handler (registered earlier) stops the stream, and everything that follows from that
+// can run before this listener. Decisions that depend on `pageUnloading` are therefore deferred with `afterEvent`.
+window.addEventListener('beforeunload', onPageUnloading, { capture: true });
+window.addEventListener('pagehide', onPageUnloading, { capture: true });
 
 /** Retry options in the form the server plugin expects. */
 function getRetryOptions() {
@@ -65,15 +92,40 @@ function getRetryOptions() {
  * @property {Array<[number, number]>} recv [client time, bytes received so far] for each chunk the client received
  * @property {HeadersInit} headers Request headers
  * @property {boolean} acked Whether the job was acknowledged to the server
+ * @property {boolean} finished Whether the response was fully received
+ * @property {boolean} cancelled Whether a cancel was sent
  * @type {PageJob[]}
  */
 const pageJobs = [];
 
 /** Tells the server this page has handled the job, so it isn't offered for recovery. */
+/** Runs a callback after the current event (and the unload handlers it may be part of) has been fully dispatched. */
+function afterEvent(callback) {
+    setTimeout(callback, 0);
+}
+
 function ackJob(job) {
     if (job.acked) return;
+    afterEvent(() => {
+        // A closing page hasn't saved the result; leave it for recovery on the next page.
+        if (job.acked || pageUnloading) return;
+        job.acked = true;
+        originalFetch(`${BASE}/jobs/${job.id}/ack`, { method: 'POST', headers: job.headers }).catch(() => { });
+    });
+}
+
+/**
+ * Cancels the job on the server (which also acknowledges it).
+ * @param {PageJob} job
+ * @param {object} [options]
+ * @param {boolean} [options.keepalive] Let the request outlive the page
+ */
+function cancelJob(job, { keepalive = false } = {}) {
+    // Not gated on `acked`: stopping a generation also ends it, which acknowledges the job right before this runs.
+    if (job.cancelled || job.finished) return;
+    job.cancelled = true;
     job.acked = true;
-    originalFetch(`${BASE}/jobs/${job.id}/ack`, { method: 'POST', headers: job.headers }).catch(() => { });
+    originalFetch(`${BASE}/jobs/${job.id}/cancel`, { method: 'POST', headers: job.headers, keepalive }).catch(() => { });
 }
 
 class FatalJobError extends Error { }
@@ -150,7 +202,7 @@ async function resumableFetch(input, init, target) {
 
     const { id } = await startResponse.json();
     /** @type {PageJob} */
-    const pageJob = { id, clientStart, recv, headers, acked: false };
+    const pageJob = { id, clientStart, recv, headers, acked: false, finished: false, cancelled: false };
     pageJobs.push(pageJob);
     pageJobs.splice(0, Math.max(0, pageJobs.length - 20));
     if (retryOptions.enabled && !meta.quiet) watchRetries(pageJob);
@@ -161,10 +213,15 @@ async function resumableFetch(input, init, target) {
 
     const onAbort = () => {
         attachController?.abort();
-        if (!finished) {
-            pageJob.acked = true; // Cancelling acknowledges it server-side
-            originalFetch(`${BASE}/jobs/${id}/cancel`, { method: 'POST', headers }).catch(() => { });
-        }
+        if (finished) return;
+        // If this abort comes from SillyTavern reacting to the page unloading, our listener has flagged it by then.
+        afterEvent(() => {
+            if (pageUnloading && !getSettings().general.stopOnClose) {
+                console.info('[resumable-gen] Page is closing; leaving the generation running on the server');
+                return;
+            }
+            cancelJob(pageJob, { keepalive: pageUnloading });
+        });
     };
     signal?.addEventListener('abort', onAbort, { once: true });
 
@@ -224,6 +281,7 @@ async function resumableFetch(input, init, target) {
                     if (signal?.aborted) throw abortError();
                     if (await isComplete()) {
                         finished = true;
+                        pageJob.finished = true;
                         signal?.removeEventListener('abort', onAbort);
                         ackJob(pageJob);
                         controller.close();
@@ -714,8 +772,11 @@ async function checkForRecoverableJobs() {
                 <div style="text-align:left;max-height:50vh;overflow:auto;white-space:pre-wrap;border:1px solid var(--SmartThemeBorderColor);padding:8px;border-radius:6px;">${escapeHtml(text)}</div>`;
             const lastMessage = context.chat[context.chat.length - 1];
             const canSwipe = lastMessage && !lastMessage.is_user && !lastMessage.is_system;
+            // The page that started the generation may have left an empty placeholder when it was closed.
+            const canFill = canSwipe && ['', '...'].includes(String(lastMessage.mes ?? '').trim());
             const customButtons = [{ text: '稍后再说', result: 3 }];
             if (canSwipe) customButtons.unshift({ text: '添加为最后一条的新滑动', result: 2 });
+            if (canFill) customButtons.unshift({ text: '填入最后一条空消息', result: 4 });
 
             const result = await context.callGenericPopup(html, context.POPUP_TYPE.CONFIRM, '', {
                 okButton: '作为新消息插入',
@@ -743,6 +804,21 @@ async function checkForRecoverableJobs() {
                 context.addOneMessage(message);
                 renderAllRetryLabels();
                 await context.saveChat();
+            } else if (result === 4 && canFill) {
+                const message = context.chat[context.chat.length - 1];
+                const retry = toRetryInfo(job);
+                message.mes = text;
+                message.extra = { ...(message.extra ?? {}), reasoning: reasoning || undefined, resumable_retry: retry ?? undefined };
+                if (Array.isArray(message.swipes)) {
+                    const swipeId = message.swipe_id ?? 0;
+                    message.swipes[swipeId] = text;
+                    if (message.swipe_info?.[swipeId]) {
+                        message.swipe_info[swipeId].extra = { ...(message.swipe_info[swipeId].extra ?? {}), reasoning: reasoning || undefined, resumable_retry: retry ?? undefined };
+                    }
+                }
+                await context.saveChat();
+                await context.reloadCurrentChat();
+                renderAllRetryLabels();
             } else if (result === 2 && canSwipe) {
                 const message = context.chat[context.chat.length - 1];
                 if (!Array.isArray(message.swipes)) {
@@ -782,7 +858,6 @@ async function checkForRecoverableJobs() {
 function initSettingsUi() {
     const container = document.getElementById('extensions_settings2') ?? document.getElementById('extensions_settings');
     if (!container) return;
-    const { retry } = getSettings();
     const html = `
         <div class="resumable-gen-settings">
             <div class="inline-drawer">
@@ -791,6 +866,12 @@ function initSettingsUi() {
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
                 <div class="inline-drawer-content">
+                    <label class="checkbox_label" for="resumable_gen_stop_on_close">
+                        <input type="checkbox" id="resumable_gen_stop_on_close">
+                        <span>关闭页面时停止生成</span>
+                    </label>
+                    <small class="resumable-gen-hint">默认关闭：关掉或刷新页面后，生成仍会在服务器上跑完，下次在任意设备打开这个聊天都可以恢复。只有点"停止"按钮才会取消。开启后，关闭页面会尽量通知服务器停止（iOS 在后台杀掉页面时可能来不及通知）。</small>
+                    <hr>
                     <label class="checkbox_label" for="resumable_gen_retry_enabled">
                         <input type="checkbox" id="resumable_gen_retry_enabled">
                         <span>空回复时自动重试</span>
@@ -819,26 +900,27 @@ function initSettingsUi() {
     container.insertAdjacentHTML('beforeend', html);
 
     const save = () => SillyTavern.getContext().saveSettingsDebounced();
-    const bindCheckbox = (id, key) => {
+    const bindCheckbox = (id, section, key) => {
         const input = /** @type {HTMLInputElement} */ (document.getElementById(id));
-        input.checked = !!retry[key];
-        input.addEventListener('input', () => { getSettings().retry[key] = input.checked; save(); });
+        input.checked = !!getSettings()[section][key];
+        input.addEventListener('input', () => { getSettings()[section][key] = input.checked; save(); });
     };
-    const bindNumber = (id, key, min, max) => {
+    const bindNumber = (id, section, key, min, max) => {
         const input = /** @type {HTMLInputElement} */ (document.getElementById(id));
-        input.value = String(retry[key]);
+        input.value = String(getSettings()[section][key]);
         input.addEventListener('input', () => {
             const value = Number(input.value);
             if (!Number.isFinite(value)) return;
-            getSettings().retry[key] = Math.min(max, Math.max(min, value));
+            getSettings()[section][key] = Math.min(max, Math.max(min, value));
             save();
         });
     };
-    bindCheckbox('resumable_gen_retry_enabled', 'enabled');
-    bindNumber('resumable_gen_retry_max', 'maxRetries', 1, 10);
-    bindNumber('resumable_gen_retry_delay', 'delaySeconds', 0, 60);
-    bindCheckbox('resumable_gen_retry_reasoning', 'reasoningOnlyIsEmpty');
-    bindCheckbox('resumable_gen_retry_error', 'retryOnError');
+    bindCheckbox('resumable_gen_stop_on_close', 'general', 'stopOnClose');
+    bindCheckbox('resumable_gen_retry_enabled', 'retry', 'enabled');
+    bindNumber('resumable_gen_retry_max', 'retry', 'maxRetries', 1, 10);
+    bindNumber('resumable_gen_retry_delay', 'retry', 'delaySeconds', 0, 60);
+    bindCheckbox('resumable_gen_retry_reasoning', 'retry', 'reasoningOnlyIsEmpty');
+    bindCheckbox('resumable_gen_retry_error', 'retry', 'retryOnError');
 }
 
 (function initResumableGeneration() {

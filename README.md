@@ -8,6 +8,7 @@
 
 - 切出去再切回来，流式输出会从断开的位置接着往下走，酒馆这边感知不到中断。
 - 如果页面被系统彻底杀掉并重新加载了，回到同一个聊天时会弹窗，让你把后台已经完成的结果插入为新消息或新滑动（swipe）。
+- 关闭或刷新页面不会停止生成，可以换一台设备打开同一个聊天接着看。
 - 点"停止"按钮会同时取消服务器上的请求，不会白白消耗 API 额度。
 - 切到后台期间的时间不会算进消息的生成计时器。
 - 可选：回复为空（例如被审查过滤）时自动重试，重试进度显示在消息左侧的 token 数下面。
@@ -94,6 +95,12 @@ https://github.com/Sakura-Byte/SillyTavern-ResumableGen
 
 也可以用手机试一下：发一条消息，生成到一半时切到别的 App，十几秒后切回来，文字应该会接着往下出。
 
+## 关闭页面时会怎样
+
+默认情况下，**关闭或刷新页面不会停止生成**，只有点"停止"按钮才会取消。原因是从页面这边分辨不出"不玩了"和"换设备"，而 iOS 在后台杀掉页面，看起来和用户自己关闭几乎一样。生成会在服务器上跑完，结果保留 1 小时，下次在任意设备打开这个聊天时弹窗恢复。如果你确实不想要，在弹窗里点"丢弃"即可。
+
+如果更希望"关掉页面就停"，可以在"扩展"面板里展开 **Resumable Generation**，勾选"关闭页面时停止生成"。注意，iOS 在后台杀掉页面时可能来不及通知服务器，所以这个开关只能尽量做到。
+
 ## 空回复自动重试
 
 默认关闭。在"扩展"面板里展开 **Resumable Generation** 开启，可以设置：
@@ -134,6 +141,7 @@ https://github.com/Sakura-Byte/SillyTavern-ResumableGen
 - **非流式请求的重试进度**：生成完成前页面上还没有对应的消息，所以要等生成完成后才会显示。
 - **恢复弹窗的范围**：只对当前打开的聊天弹出，不包括后台静默生成（例如总结）。
 - **"继续"或"代拟"的恢复**：恢复弹窗只提供"新消息"和"新滑动"两种插入方式。如果被中断的是"继续"或"代拟"，请手动复制需要的内容。
+- **恢复弹窗的选项**：如果原页面关闭时留下了一条空的 "..." 消息，弹窗会多一个"填入最后一条空消息"的选项。
 - **跨设备**：在另一台设备上打开同一个聊天时：
   - 如果生成还在进行，会显示一个提示（含自动重试进度），完成后自动弹出恢复窗口。
   - 如果原页面还开着，它会自己保存回复，这边只提示"点此刷新聊天"，不会重复弹恢复窗口。
@@ -151,6 +159,7 @@ Keeps SillyTavern generation requests running on the server so the browser can r
 
 - A dropped stream resumes transparently from the last received byte.
 - If the page was killed and reloaded, finished results can be recovered into the chat as a new message or swipe.
+- Closing or reloading the page does not stop the generation (so you can switch devices); only the Stop button cancels it. An option to stop on close is available in the extension settings.
 - Pressing Stop also cancels the request on the server.
 - Time spent suspended in the background doesn't count toward the message's generation timer.
 - Optional: retry empty replies (e.g. blocked by a content filter) on the server, with progress shown under the message's token counter. Enable it under Extensions → Resumable Generation.
