@@ -4,7 +4,8 @@
     "requires": [],
     "optional": [],
     "js": "client/index.js",
+    "css": "client/style.css",
     "author": "Sakura-Byte",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "homePage": "https://github.com/Sakura-Byte/SillyTavern-ResumableGen"
 }

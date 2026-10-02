@@ -9,6 +9,8 @@
 - 切出去再切回来，流式输出会从断开的位置接着往下走，酒馆这边感知不到中断。
 - 如果页面被系统彻底杀掉并重新加载了，回到同一个聊天时会弹窗，让你把后台已经完成的结果插入为新消息或新滑动（swipe）。
 - 点"停止"按钮会同时取消服务器上的请求，不会白白消耗 API 额度。
+- 切到后台期间的时间不会算进消息的生成计时器。
+- 可选：回复为空（例如被审查过滤）时自动重试，重试进度显示在消息左侧的 token 数下面。
 
 支持的接口：Chat Completion、Text Completion、KoboldAI、NovelAI。
 
@@ -23,7 +25,7 @@
 
 不修改酒馆的任何核心文件。
 
-> **安全提示：** 服务端插件运行在酒馆的服务器进程里，拥有和酒馆一样的权限。这也是酒馆默认禁用服务端插件的原因。安装前请自行检查代码（只有 `server/index.cjs` 一个文件）。
+> **安全提示：** 服务端插件运行在酒馆的服务器进程里，拥有和酒馆一样的权限。这也是酒馆默认禁用服务端插件的原因。安装前请自行检查代码（`server/` 目录下的两个文件）。
 
 ## 安装
 
@@ -92,6 +94,26 @@ https://github.com/Sakura-Byte/SillyTavern-ResumableGen
 
 也可以用手机试一下：发一条消息，生成到一半时切到别的 App，十几秒后切回来，文字应该会接着往下出。
 
+## 空回复自动重试
+
+默认关闭。在"扩展"面板里展开 **Resumable Generation** 开启，可以设置：
+
+| 选项 | 默认 | 说明 |
+| --- | --- | --- |
+| 空回复时自动重试 | 关 | 总开关 |
+| 最大重试次数 | 3 | 1 到 10 次 |
+| 重试间隔（秒） | 1 | 每次重试前等待的时间 |
+| 只有思考、没有正文也算空回复 | 开 | 关闭后思考内容会实时显示，但"思考完后正文被拦截"就无法重试 |
+| 上游报错时也重试 | 关 | HTTP 错误、连接失败时也重试 |
+
+工作方式：
+
+- 判断和重试都在服务器上进行，手机切到后台时也照常重试。
+- 开启后，服务器会先扣住回复，直到出现真正的正文才开始发给页面。这对"假流式"接口（先发一串空的心跳块，最后一次性给出全部内容）同样有效。
+- 重试过程中，消息左侧的 token 数下面会实时显示"自动重试 1/3"。生成完后保留在消息上，刷新页面、切换滑动后仍然可见。如果重试次数用完仍为空，会以警告色显示，并弹出提示。
+- 重试会重新发送完整请求，可能产生额外的 API 费用。
+- 已经开始输出正文的回复不会被重试。
+
 ## 更新
 
 - **服务端插件**：`enableServerPluginsAutoUpdate` 默认开启，每次启动酒馆时会自动 `git pull`。也可以手动在插件目录执行 `git pull`，然后重启酒馆。
@@ -109,6 +131,7 @@ https://github.com/Sakura-Byte/SillyTavern-ResumableGen
 - **白名单**：插件通过 `127.0.0.1` / `::1` 访问酒馆自己。如果你改过 `config.yaml` 里的 `whitelist`，请确保保留这两个地址（默认就有）。
 - **任务保存在内存里**：酒馆重启后，所有任务都会丢失。已完成但没有被收取的结果保留 1 小时，单个任务最多运行 30 分钟。
 - **多用户模式下**，每个用户只能看到自己的任务。
+- **非流式请求的重试进度**：生成完成前页面上还没有对应的消息，所以要等生成完成后才会显示。
 - **恢复弹窗的范围**：只对当前打开的聊天弹出，不包括后台静默生成（例如总结）。
 - **"继续"或"代拟"的恢复**：恢复弹窗只提供"新消息"和"新滑动"两种插入方式。如果被中断的是"继续"或"代拟"，请手动复制需要的内容。
 - **跨设备**：在另一台设备上打开同一个聊天，也能看到恢复弹窗。但如果原设备的页面其实没被杀（只是被冻结），它回来后也会写入，可能产生重复消息，删掉一条即可。
@@ -126,6 +149,8 @@ Keeps SillyTavern generation requests running on the server so the browser can r
 - A dropped stream resumes transparently from the last received byte.
 - If the page was killed and reloaded, finished results can be recovered into the chat as a new message or swipe.
 - Pressing Stop also cancels the request on the server.
+- Time spent suspended in the background doesn't count toward the message's generation timer.
+- Optional: retry empty replies (e.g. blocked by a content filter) on the server, with progress shown under the message's token counter. Enable it under Extensions → Resumable Generation.
 
 The project has **two parts in one repository, and both are required**:
 

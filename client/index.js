@@ -11,7 +11,8 @@ import { getMessageTimeStamp } from '../../../../RossAscends-mods.js';
 
 const BASE = '/api/plugins/resumable-gen';
 /** Must match PROTOCOL in server/index.cjs. */
-const PROTOCOL = 1;
+const PROTOCOL = 2;
+const SETTINGS_KEY = 'resumable-gen';
 const README_URL = 'https://github.com/Sakura-Byte/SillyTavern-ResumableGen#readme';
 const NOTICE_DISMISS_KEY = 'resumable-gen:dismiss-notice';
 const TARGETS = {
@@ -26,6 +27,35 @@ const MAX_RETRY_MS = 10 * 60 * 1000;
 const originalFetch = window.fetch.bind(window);
 let pluginAvailable = true;
 let lastGeneration = { type: 'normal', quiet: false };
+
+const DEFAULT_SETTINGS = Object.freeze({
+    retry: {
+        enabled: false,
+        maxRetries: 3,
+        delaySeconds: 1,
+        reasoningOnlyIsEmpty: true,
+        retryOnError: false,
+    },
+});
+
+function getSettings() {
+    const { extensionSettings } = SillyTavern.getContext();
+    const settings = extensionSettings[SETTINGS_KEY] ?? (extensionSettings[SETTINGS_KEY] = {});
+    settings.retry = { ...DEFAULT_SETTINGS.retry, ...(settings.retry ?? {}) };
+    return settings;
+}
+
+/** Retry options in the form the server plugin expects. */
+function getRetryOptions() {
+    const { retry } = getSettings();
+    return {
+        enabled: retry.enabled,
+        maxRetries: retry.maxRetries,
+        delayMs: Math.round(retry.delaySeconds * 1000),
+        retryOnError: retry.retryOnError,
+        reasoningCounts: !retry.reasoningOnlyIsEmpty,
+    };
+}
 
 /**
  * Jobs started by this page.
@@ -103,7 +133,9 @@ async function resumableFetch(input, init, target) {
     const clientStart = Date.now();
     /** @type {Array<[number, number]>} */
     const recv = [];
-    const wrapped = `{"target":${JSON.stringify(target)},"meta":${JSON.stringify(getMeta())},"payload":${init.body}}`;
+    const retryOptions = getRetryOptions();
+    const meta = getMeta();
+    const wrapped = `{"target":${JSON.stringify(target)},"meta":${JSON.stringify(meta)},"options":${JSON.stringify({ retry: retryOptions })},"payload":${init.body}}`;
     const startResponse = await originalFetch(`${BASE}/start`, { method: 'POST', headers, body: wrapped, signal });
 
     if (startResponse.status === 404 && !startResponse.headers.get('content-type')?.includes('json')) {
@@ -121,6 +153,7 @@ async function resumableFetch(input, init, target) {
     const pageJob = { id, clientStart, recv, headers, acked: false };
     pageJobs.push(pageJob);
     pageJobs.splice(0, Math.max(0, pageJobs.length - 20));
+    if (retryOptions.enabled && !meta.quiet) watchRetries(pageJob);
     let received = 0;
     let finished = false;
     /** @type {AbortController|null} */
@@ -234,6 +267,118 @@ window.fetch = async function (input, init) {
 };
 
 // ---------------------------------------------------------------------------
+// Empty response retries
+// ---------------------------------------------------------------------------
+// Retries happen on the server. The page polls the job while it runs and shows the progress under the message's
+// token counter; the final count is kept in the message's extra data so it survives reloads and swipes.
+
+const RETRY_POLL_MS = 1000;
+
+/**
+ * @typedef {object} RetryInfo
+ * @property {number} retries Retries performed
+ * @property {number} max Max retries allowed
+ * @property {boolean} exhausted All attempts came back empty
+ */
+
+/**
+ * Shows (or removes) the retry label under a message's token counter.
+ * @param {Element|null} messageElement
+ * @param {RetryInfo|null} info
+ */
+function renderRetryLabel(messageElement, info) {
+    const wrapper = messageElement?.querySelector('.mesAvatarWrapper');
+    if (!wrapper) return;
+    let label = wrapper.querySelector('.resumable-gen-retry');
+    if (!info || info.retries <= 0) {
+        label?.remove();
+        return;
+    }
+    if (!label) {
+        label = document.createElement('div');
+        label.className = 'resumable-gen-retry';
+        const anchor = wrapper.querySelector('.tokenCounterDisplay') ?? wrapper.querySelector('.mes_timer');
+        anchor ? anchor.after(label) : wrapper.append(label);
+    }
+    label.textContent = `自动重试 ${info.retries}/${info.max}`;
+    label.classList.toggle('exhausted', !!info.exhausted);
+    label.title = info.exhausted
+        ? `已自动重试 ${info.retries} 次，回复仍为空`
+        : `回复为空，已自动重试 ${info.retries} 次（最多 ${info.max} 次）`;
+}
+
+/** @returns {RetryInfo|null} */
+function toRetryInfo(job) {
+    if (!job || job.maxAttempts <= 1 || job.attempt <= 1) return null;
+    return { retries: job.attempt - 1, max: job.maxAttempts - 1, exhausted: !!job.exhausted };
+}
+
+/** Renders retry labels for all rendered messages, from their saved data. */
+function renderAllRetryLabels() {
+    const { chat } = SillyTavern.getContext();
+    for (const element of document.querySelectorAll('#chat .mes')) {
+        const message = chat[Number(element.getAttribute('mesid'))];
+        renderRetryLabel(element, message?.extra?.resumable_retry ?? null);
+    }
+}
+
+/**
+ * Polls a running job and shows its retry progress on the message being generated.
+ * @param {PageJob} job
+ */
+async function watchRetries(job) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < 30 * 60 * 1000) {
+        await new Promise(resolve => setTimeout(resolve, RETRY_POLL_MS));
+        let info;
+        try {
+            const response = await originalFetch(`${BASE}/jobs/${job.id}`, { headers: job.headers, cache: 'no-store' });
+            if (!response.ok) return;
+            info = await response.json();
+        } catch {
+            continue;
+        }
+        const retry = toRetryInfo(info);
+        if (retry) {
+            // The message being streamed is the last one; skip if SillyTavern hasn't created it (non-streaming).
+            const element = document.querySelector('#chat .mes.last_mes:not([is_user="true"])');
+            renderRetryLabel(element, retry);
+        }
+        if (info.done) return;
+    }
+}
+
+/**
+ * Stores the final retry count of a generation on its message.
+ * @param {number} messageId
+ * @param {object} info Job info from the server
+ */
+function saveRetryInfo(messageId, info) {
+    const message = SillyTavern.getContext().chat[messageId];
+    if (!message) return;
+    const retry = toRetryInfo(info);
+    const extra = message.extra ?? (message.extra = {});
+    if (retry) {
+        extra.resumable_retry = retry;
+    } else {
+        delete extra.resumable_retry;
+    }
+    const swipeInfo = message.swipe_info?.[message.swipe_id ?? 0];
+    if (swipeInfo) {
+        swipeInfo.extra = swipeInfo.extra ?? {};
+        if (retry) {
+            swipeInfo.extra.resumable_retry = retry;
+        } else {
+            delete swipeInfo.extra.resumable_retry;
+        }
+    }
+    renderRetryLabel(document.querySelector(`#chat .mes[mesid="${messageId}"]`), retry);
+    if (retry?.exhausted) {
+        toastr.warning(`已自动重试 ${retry.retries} 次，回复仍为空。`, 'Resumable Generation');
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Generation timer correction
 // ---------------------------------------------------------------------------
 // SillyTavern times generations with the browser's wall clock. When the page was suspended and the stream resumed
@@ -279,7 +424,11 @@ function formatTimer(started, finished, tokenCount, reasoningDuration, timeToFir
     return { value, title };
 }
 
-async function correctGenerationTimer(messageId) {
+/**
+ * Updates a just-received message with data from the job that generated it: retry count and corrected timer.
+ * @param {number} messageId
+ */
+async function onMessageReceived(messageId) {
     const context = SillyTavern.getContext();
     const message = context.chat[messageId];
     if (!message || message.is_user || !message.gen_started || !message.gen_finished) return;
@@ -287,13 +436,28 @@ async function correctGenerationTimer(messageId) {
     const started = new Date(message.gen_started).getTime();
     const finished = new Date(message.gen_finished).getTime();
     // The last job started during this generation (tool calls can produce several; the last one ends it).
-    const job = pageJobs.findLast(j => j.clientStart >= started - 1000 && j.clientStart <= finished && j.recv.length > 0);
+    const job = pageJobs.findLast(j => j.clientStart >= started - 1000 && j.clientStart <= finished);
     if (!job) return;
 
     const response = await originalFetch(`${BASE}/jobs/${job.id}?timeline=1`, { headers: job.headers, cache: 'no-store' });
     if (!response.ok) return;
-    const { timeline } = await response.json();
-    if (!Array.isArray(timeline) || timeline.length === 0) return;
+    const info = await response.json();
+    saveRetryInfo(messageId, info);
+    correctGenerationTimer(messageId, job, info.timeline);
+}
+
+/**
+ * @param {number} messageId
+ * @param {PageJob} job
+ * @param {Array<[number, number]>} timeline
+ */
+function correctGenerationTimer(messageId, job, timeline) {
+    const context = SillyTavern.getContext();
+    const message = context.chat[messageId];
+    if (!Array.isArray(timeline) || timeline.length === 0 || job.recv.length === 0) return;
+
+    const started = new Date(message.gen_started).getTime();
+    const finished = new Date(message.gen_finished).getTime();
 
     // Time between the last received chunk and the message being finalized is local processing, keep it.
     const lastRecv = Math.min(finished, job.recv[job.recv.length - 1][0]);
@@ -522,15 +686,87 @@ async function checkForRecoverableJobs() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Settings UI
+// ---------------------------------------------------------------------------
+
+function initSettingsUi() {
+    const container = document.getElementById('extensions_settings2') ?? document.getElementById('extensions_settings');
+    if (!container) return;
+    const { retry } = getSettings();
+    const html = `
+        <div class="resumable-gen-settings">
+            <div class="inline-drawer">
+                <div class="inline-drawer-toggle inline-drawer-header">
+                    <b>Resumable Generation</b>
+                    <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                </div>
+                <div class="inline-drawer-content">
+                    <label class="checkbox_label" for="resumable_gen_retry_enabled">
+                        <input type="checkbox" id="resumable_gen_retry_enabled">
+                        <span>空回复时自动重试</span>
+                    </label>
+                    <small class="resumable-gen-hint">在服务器上判断回复是否为空（例如被审查过滤），为空就重新请求。重试进度显示在消息左侧的 token 数下面。开启后，在出现正文之前不会向页面输出任何内容。</small>
+                    <div class="resumable-gen-row">
+                        <label for="resumable_gen_retry_max">最大重试次数</label>
+                        <input type="number" id="resumable_gen_retry_max" class="text_pole" min="1" max="10" step="1">
+                    </div>
+                    <div class="resumable-gen-row">
+                        <label for="resumable_gen_retry_delay">重试间隔（秒）</label>
+                        <input type="number" id="resumable_gen_retry_delay" class="text_pole" min="0" max="60" step="0.5">
+                    </div>
+                    <label class="checkbox_label" for="resumable_gen_retry_reasoning">
+                        <input type="checkbox" id="resumable_gen_retry_reasoning">
+                        <span>只有思考、没有正文也算空回复</span>
+                    </label>
+                    <small class="resumable-gen-hint">关闭后，思考内容一出现就开始显示，但"思考完后正文被拦截"的情况就无法重试了。</small>
+                    <label class="checkbox_label" for="resumable_gen_retry_error">
+                        <input type="checkbox" id="resumable_gen_retry_error">
+                        <span>上游报错（HTTP 错误、连接失败）时也重试</span>
+                    </label>
+                </div>
+            </div>
+        </div>`;
+    container.insertAdjacentHTML('beforeend', html);
+
+    const save = () => SillyTavern.getContext().saveSettingsDebounced();
+    const bindCheckbox = (id, key) => {
+        const input = /** @type {HTMLInputElement} */ (document.getElementById(id));
+        input.checked = !!retry[key];
+        input.addEventListener('input', () => { getSettings().retry[key] = input.checked; save(); });
+    };
+    const bindNumber = (id, key, min, max) => {
+        const input = /** @type {HTMLInputElement} */ (document.getElementById(id));
+        input.value = String(retry[key]);
+        input.addEventListener('input', () => {
+            const value = Number(input.value);
+            if (!Number.isFinite(value)) return;
+            getSettings().retry[key] = Math.min(max, Math.max(min, value));
+            save();
+        });
+    };
+    bindCheckbox('resumable_gen_retry_enabled', 'enabled');
+    bindNumber('resumable_gen_retry_max', 'maxRetries', 1, 10);
+    bindNumber('resumable_gen_retry_delay', 'delaySeconds', 0, 60);
+    bindCheckbox('resumable_gen_retry_reasoning', 'reasoningOnlyIsEmpty');
+    bindCheckbox('resumable_gen_retry_error', 'retryOnError');
+}
+
 (function initResumableGeneration() {
     const { eventSource, eventTypes } = SillyTavern.getContext();
     eventSource.on(eventTypes.MESSAGE_RECEIVED, async (messageId) => {
         try {
-            await correctGenerationTimer(Number(messageId));
+            await onMessageReceived(Number(messageId));
         } catch (error) {
-            console.warn('[resumable-gen] Timer correction failed', error);
+            console.warn('[resumable-gen] Updating received message failed', error);
         }
     });
+    // Re-render retry labels whenever messages are (re)drawn.
+    const rerender = () => setTimeout(renderAllRetryLabels, 0);
+    for (const event of [eventTypes.CHAT_CHANGED, eventTypes.MORE_MESSAGES_LOADED, eventTypes.MESSAGE_SWIPED, eventTypes.MESSAGE_UPDATED, eventTypes.CHARACTER_MESSAGE_RENDERED, eventTypes.MESSAGE_DELETED]) {
+        if (event) eventSource.on(event, rerender);
+    }
+    initSettingsUi();
     // SillyTavern may stop reading a stream at [DONE] before it technically ends, so acknowledge everything this
     // page started once a generation is over. The page is alive and has handled them.
     eventSource.on(eventTypes.GENERATION_ENDED, () => pageJobs.forEach(ackJob));
