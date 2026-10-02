@@ -166,6 +166,8 @@ function getTargetPath(input, init) {
 
 function getMeta() {
     const context = SillyTavern.getContext();
+    const last = context.chat?.[context.chat.length - 1];
+    const lastSwipeId = last?.swipe_id ?? 0;
     return {
         pageId: PAGE_ID,
         chatId: context.getCurrentChatId?.() ?? null,
@@ -174,7 +176,18 @@ function getMeta() {
         name: context.name2 ?? '',
         type: lastGeneration.type,
         quiet: lastGeneration.quiet,
+        // Chat state when the request was sent, so a recovered reply can be put exactly where it belongs.
+        chatLength: context.chat?.length ?? null,
+        lastMesLength: typeof last?.mes === 'string' ? last.mes.length : null,
+        lastSwipes: Array.isArray(last?.swipes) ? last.swipes.length : 1,
+        lastSwipeId,
+        lastSwipeEmpty: isPlaceholderText(Array.isArray(last?.swipes) ? last.swipes[lastSwipeId] : last?.mes),
     };
+}
+
+/** True for the text of a message SillyTavern created but never filled. */
+function isPlaceholderText(text) {
+    return ['', '...'].includes(String(text ?? '').trim());
 }
 
 async function resumableFetch(input, init, target) {
@@ -487,6 +500,7 @@ function formatTimer(started, finished, tokenCount, reasoningDuration, timeToFir
  * @param {number} messageId
  */
 async function onMessageReceived(messageId) {
+    if (insertingRecovered) return;
     const context = SillyTavern.getContext();
     const message = context.chat[messageId];
     if (!message || message.is_user || !message.gen_started || !message.gen_finished) return;
@@ -730,6 +744,193 @@ async function watchForeignJob(job) {
     }
 }
 
+/**
+ * Where a recovered reply goes.
+ * @typedef {object} Placement
+ * @property {'new'|'replace'|'swipe'|'append'|'input'} mode
+ *   new: add a message; replace: replace the last message's current swipe; swipe: put into swipe `swipeIndex` of the
+ *   last message (adding it if needed); append: append to the last message; input: put into the input box
+ * @property {number} [swipeIndex] For 'swipe'
+ * @property {number} [baseLength] For 'append': length of the last message before the generation
+ * @property {string} description Shown to the user
+ */
+
+/**
+ * Works out where a recovered reply belongs, from the generation type and the chat state recorded when it was sent.
+ * @param {any} job Job info from the server
+ * @returns {Placement}
+ */
+function planPlacement(job) {
+    const { chat } = SillyTavern.getContext();
+    const meta = job.meta ?? {};
+    const type = meta.type ?? 'normal';
+    const last = chat[chat.length - 1];
+    const lastIsBot = !!last && !last.is_user && !last.is_system;
+    const recorded = Number.isInteger(meta.chatLength);
+    const changedNote = '聊天在生成期间有变化，';
+
+    if (type === 'impersonate') {
+        return { mode: 'input', description: '将填入输入框（这是一次"代拟"生成）。' };
+    }
+
+    if (type === 'continue' || type === 'swipe') {
+        // These extend the last message, which must still be the same one.
+        const sameChat = recorded ? chat.length === meta.chatLength : true;
+        if (lastIsBot && sameChat) {
+            if (type === 'continue') {
+                const baseLength = Number.isInteger(meta.lastMesLength) ? meta.lastMesLength : String(last.mes ?? '').length;
+                return { mode: 'append', baseLength, description: '将接在最后一条消息的正文后面（这是一次"继续"生成）。' };
+            }
+            // SillyTavern may or may not have created the new swipe slot before sending the request.
+            const swipeIndex = recorded ? (meta.lastSwipeEmpty ? meta.lastSwipeId : meta.lastSwipes) : (Array.isArray(last.swipes) ? last.swipes.length : 1);
+            return { mode: 'swipe', swipeIndex, description: '将作为最后一条消息的新滑动（这是一次"滑动"生成）。' };
+        }
+        return { mode: 'new', description: `${changedNote}将作为新消息插入。` };
+    }
+
+    if (recorded) {
+        // The page that started it saves the reply as a new message at index chatLength when streaming begins;
+        // if that (possibly partial) message is there, replace it.
+        if (chat.length === meta.chatLength + 1 && lastIsBot) {
+            return { mode: 'replace', description: '将替换生成中断时留下的那条回复。' };
+        }
+        if (chat.length === meta.chatLength) {
+            return { mode: 'new', description: '将作为新消息插入。' };
+        }
+        return { mode: 'new', description: `${changedNote}将作为新消息插入到最后。` };
+    }
+
+    // Jobs from older versions don't have the chat state.
+    if (lastIsBot && isPlaceholderText(last.mes)) {
+        return { mode: 'replace', description: '将替换最后一条空回复。' };
+    }
+    return { mode: 'new', description: '将作为新消息插入。' };
+}
+
+/**
+ * Puts a recovered reply into the chat the way SillyTavern does for a received message, firing the same events so
+ * other extensions (e.g. ones rendering HTML in messages) process it.
+ * @param {any} job Job info from the server
+ * @param {string} text Reply text
+ * @param {string} reasoning Reasoning text
+ * @param {Placement} placement Where it goes
+ */
+async function insertRecoveredReply(job, text, reasoning, placement) {
+    insertingRecovered = true;
+    try {
+        await insertRecoveredReplyInner(job, text, reasoning, placement);
+    } finally {
+        insertingRecovered = false;
+    }
+}
+
+/** True while a recovered reply is being inserted, so its events aren't mistaken for this page's generations. */
+let insertingRecovered = false;
+
+/**
+ * @param {any} job
+ * @param {string} text
+ * @param {string} reasoning
+ * @param {Placement} placement
+ */
+async function insertRecoveredReplyInner(job, text, reasoning, placement) {
+    const context = SillyTavern.getContext();
+    const { eventSource, eventTypes } = context;
+
+    if (placement.mode === 'input') {
+        const textarea = /** @type {HTMLTextAreaElement} */ (document.getElementById('send_textarea'));
+        textarea.value = text;
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        await eventSource.emit(eventTypes.IMPERSONATE_READY, text);
+        return;
+    }
+
+    const retry = toRetryInfo(job);
+    // Server clock; close enough to the client's for a timer.
+    const genStarted = new Date(job.createdAt);
+    const genFinished = new Date(job.finishedAt || Date.now());
+    const sendDate = getMessageTimeStamp();
+    // Stale values from a placeholder must not survive.
+    const extra = {
+        reasoning: reasoning || '',
+        reasoning_duration: undefined,
+        time_to_first_token: undefined,
+        token_count: undefined,
+        resumable_retry: retry ?? undefined,
+    };
+    const swipeInfo = () => ({ send_date: sendDate, gen_started: genStarted, gen_finished: genFinished, extra: { ...extra } });
+
+    if (placement.mode === 'new') {
+        const message = {
+            name: job.meta?.name || context.name2,
+            is_user: false,
+            is_system: false,
+            send_date: sendDate,
+            gen_started: genStarted,
+            gen_finished: genFinished,
+            mes: text,
+            extra: { ...extra },
+            swipes: [text],
+            swipe_id: 0,
+            swipe_info: [swipeInfo()],
+        };
+        context.chat.push(message);
+        const messageId = context.chat.length - 1;
+        await eventSource.emit(eventTypes.MESSAGE_RECEIVED, messageId, 'normal');
+        context.addOneMessage(message);
+        await eventSource.emit(eventTypes.CHARACTER_MESSAGE_RENDERED, messageId, 'normal');
+        await context.saveChat();
+        renderAllRetryLabels();
+        return;
+    }
+
+    const messageId = context.chat.length - 1;
+    const message = context.chat[messageId];
+    if (!Array.isArray(message.swipes)) {
+        message.swipes = [message.mes];
+        message.swipe_info = [{ send_date: message.send_date, gen_started: message.gen_started, gen_finished: message.gen_finished, extra: structuredClone(message.extra ?? {}) }];
+        message.swipe_id = 0;
+    }
+    message.swipe_info = message.swipe_info ?? [];
+
+    let eventType = 'normal';
+    if (placement.mode === 'append') {
+        eventType = 'continue';
+        const swipeId = message.swipe_id ?? 0;
+        // Drop whatever partial continuation the original page saved, then add the full one.
+        const newText = String(message.mes ?? '').slice(0, placement.baseLength) + text;
+        message.mes = newText;
+        message.swipes[swipeId] = newText;
+        const info = message.swipe_info[swipeId] ?? (message.swipe_info[swipeId] = swipeInfo());
+        Object.assign(info, { gen_finished: genFinished });
+        message.gen_finished = genFinished;
+        message.extra = { ...(message.extra ?? {}), resumable_retry: retry ?? undefined };
+        info.extra = { ...(info.extra ?? {}), resumable_retry: retry ?? undefined };
+    } else {
+        let swipeId;
+        if (placement.mode === 'swipe') {
+            eventType = 'swipe';
+            swipeId = Math.min(placement.swipeIndex ?? message.swipes.length, message.swipes.length);
+        } else {
+            swipeId = message.swipe_id ?? 0;
+        }
+        message.swipes[swipeId] = text;
+        message.swipe_info[swipeId] = { ...(message.swipe_info[swipeId] ?? {}), ...swipeInfo(), extra: { ...(message.swipe_info[swipeId]?.extra ?? {}), ...extra } };
+        message.swipe_id = swipeId;
+        message.mes = text;
+        message.send_date = sendDate;
+        message.gen_started = genStarted;
+        message.gen_finished = genFinished;
+        message.extra = { ...(message.extra ?? {}), ...extra };
+    }
+
+    await eventSource.emit(eventTypes.MESSAGE_RECEIVED, messageId, eventType);
+    await context.saveChat();
+    await context.reloadCurrentChat();
+    await eventSource.emit(eventTypes.CHARACTER_MESSAGE_RENDERED, messageId, eventType);
+    renderAllRetryLabels();
+}
+
 async function checkForRecoverableJobs() {
     if (!pluginAvailable) return;
     if (recovering) {
@@ -768,20 +969,15 @@ async function checkForRecoverableJobs() {
             }
 
             const time = new Date(job.createdAt).toLocaleTimeString();
+            const placement = planPlacement(job);
             const html = `<h3>找到一条后台完成的生成（${escapeHtml(job.meta?.name ?? '')}，${time}）</h3>
-                <div style="text-align:left;max-height:50vh;overflow:auto;white-space:pre-wrap;border:1px solid var(--SmartThemeBorderColor);padding:8px;border-radius:6px;">${escapeHtml(text)}</div>`;
-            const lastMessage = context.chat[context.chat.length - 1];
-            const canSwipe = lastMessage && !lastMessage.is_user && !lastMessage.is_system;
-            // The page that started the generation may have left an empty placeholder when it was closed.
-            const canFill = canSwipe && ['', '...'].includes(String(lastMessage.mes ?? '').trim());
-            const customButtons = [{ text: '稍后再说', result: 3 }];
-            if (canSwipe) customButtons.unshift({ text: '添加为最后一条的新滑动', result: 2 });
-            if (canFill) customButtons.unshift({ text: '填入最后一条空消息', result: 4 });
+                <div style="text-align:left;max-height:50vh;overflow:auto;white-space:pre-wrap;border:1px solid var(--SmartThemeBorderColor);padding:8px;border-radius:6px;">${escapeHtml(text)}</div>
+                <small style="display:block;margin-top:6px;opacity:0.8;">${escapeHtml(placement.description)}</small>`;
 
             const result = await context.callGenericPopup(html, context.POPUP_TYPE.CONFIRM, '', {
-                okButton: '作为新消息插入',
+                okButton: '恢复',
                 cancelButton: '丢弃',
-                customButtons,
+                customButtons: [{ text: '稍后再说', result: 3 }],
                 wide: true,
                 allowVerticalScrolling: true,
             });
@@ -792,50 +988,8 @@ async function checkForRecoverableJobs() {
             }
 
             if (result === 1) {
-                const message = {
-                    name: job.meta?.name || context.name2,
-                    is_user: false,
-                    is_system: false,
-                    send_date: getMessageTimeStamp(),
-                    mes: text,
-                    extra: { ...(reasoning ? { reasoning } : {}), ...(toRetryInfo(job) ? { resumable_retry: toRetryInfo(job) } : {}) },
-                };
-                context.chat.push(message);
-                context.addOneMessage(message);
-                renderAllRetryLabels();
-                await context.saveChat();
-            } else if (result === 4 && canFill) {
-                const message = context.chat[context.chat.length - 1];
-                const retry = toRetryInfo(job);
-                message.mes = text;
-                message.extra = { ...(message.extra ?? {}), reasoning: reasoning || undefined, resumable_retry: retry ?? undefined };
-                if (Array.isArray(message.swipes)) {
-                    const swipeId = message.swipe_id ?? 0;
-                    message.swipes[swipeId] = text;
-                    if (message.swipe_info?.[swipeId]) {
-                        message.swipe_info[swipeId].extra = { ...(message.swipe_info[swipeId].extra ?? {}), reasoning: reasoning || undefined, resumable_retry: retry ?? undefined };
-                    }
-                }
-                await context.saveChat();
-                await context.reloadCurrentChat();
-                renderAllRetryLabels();
-            } else if (result === 2 && canSwipe) {
-                const message = context.chat[context.chat.length - 1];
-                if (!Array.isArray(message.swipes)) {
-                    message.swipes = [message.mes];
-                    message.swipe_info = [{ send_date: message.send_date, extra: structuredClone(message.extra ?? {}) }];
-                    message.swipe_id = 0;
-                }
-                message.swipes.push(text);
-                message.swipe_info = message.swipe_info ?? [];
-                const swipeExtra = { ...(reasoning ? { reasoning } : {}), ...(toRetryInfo(job) ? { resumable_retry: toRetryInfo(job) } : {}) };
-                message.swipe_info.push({ send_date: getMessageTimeStamp(), extra: swipeExtra });
-                message.swipe_id = message.swipes.length - 1;
-                message.mes = text;
-                message.extra = { ...(message.extra ?? {}), reasoning: reasoning || undefined, resumable_retry: swipeExtra.resumable_retry };
-                await context.saveChat();
-                await context.reloadCurrentChat();
-                renderAllRetryLabels();
+                // The chat may have changed while the popup was open.
+                await insertRecoveredReply(job, text, reasoning, planPlacement(job));
             }
 
             await ack();
