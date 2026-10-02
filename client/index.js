@@ -599,10 +599,86 @@ function escapeHtml(text) {
 }
 
 let recovering = false;
+let recheckRequested = false;
 const skippedThisSession = new Set();
+/** @type {Map<string, any>} Running jobs of other pages in the current chat, being watched until they finish */
+const watchedForeignJobs = new Map();
+const FOREIGN_POLL_MS = 2000;
+/** How long to wait after a job finished before offering it, in case the page that started it acknowledges it. */
+const ACK_GRACE_MS = 5000;
+
+/** True if the job belongs to this chat, wasn't started by this page and is a regular (non-quiet) generation. */
+function isForeignChatJob(job, chatId) {
+    return job.meta?.pageId !== PAGE_ID && !job.meta?.quiet && !!job.meta?.chatId && job.meta.chatId === chatId;
+}
+
+function describeForeignJob(job) {
+    const seconds = Math.max(0, Math.round((Date.now() - job.createdAt) / 1000));
+    const retry = toRetryInfo(job);
+    const retryText = retry ? `，自动重试 ${retry.retries}/${retry.max}` : '';
+    return `另一个页面发起的生成（${escapeHtml(job.meta?.name ?? '')}）仍在服务器上进行，已 ${seconds} 秒${retryText}。完成后会在这里提示恢复。`;
+}
+
+/**
+ * Shows a notice for a generation started by another page that is still running, and offers recovery once it
+ * finishes.
+ * @param {any} job Job info from the server
+ */
+async function watchForeignJob(job) {
+    if (watchedForeignJobs.has(job.id)) return;
+    watchedForeignJobs.set(job.id, job);
+    const toast = toastr.info(describeForeignJob(job), 'Resumable Generation', {
+        timeOut: 0,
+        extendedTimeOut: 0,
+        closeButton: true,
+        escapeHtml: false,
+        tapToDismiss: false,
+    });
+    const message = toast?.find?.('.toast-message');
+    try {
+        while (true) {
+            await new Promise(resolve => setTimeout(resolve, FOREIGN_POLL_MS));
+            const response = await originalFetch(`${BASE}/jobs/${job.id}`, { headers: SillyTavern.getContext().getRequestHeaders(), cache: 'no-store' });
+            if (!response.ok) return;
+            job = await response.json();
+            if (job.cancelled) return;
+            // The original page is alive and finished it; it has saved the reply to the chat, which this page
+            // doesn't have yet.
+            if (job.acked) {
+                if (job.done && job.meta?.chatId === SillyTavern.getContext().getCurrentChatId?.()) {
+                    toastr.info('另一个页面已完成这次生成并保存了回复。点此刷新聊天以显示新消息。', 'Resumable Generation', {
+                        timeOut: 15000,
+                        onclick: () => SillyTavern.getContext().reloadCurrentChat(),
+                    });
+                }
+                return;
+            }
+            // Stop watching when the user leaves the chat; coming back checks again.
+            if (job.meta?.chatId !== SillyTavern.getContext().getCurrentChatId?.()) return;
+            if (job.done) {
+                // If the original page is still alive it acknowledges the job right after finishing; give it time,
+                // so the result isn't offered here too.
+                await new Promise(resolve => setTimeout(resolve, ACK_GRACE_MS));
+                checkForRecoverableJobs();
+                return;
+            }
+            message?.html(describeForeignJob(job));
+        }
+    } catch (error) {
+        console.warn('[resumable-gen] Watching job failed', error);
+    } finally {
+        watchedForeignJobs.delete(job.id);
+        toast && toastr.clear(toast, { force: true });
+    }
+}
 
 async function checkForRecoverableJobs() {
-    if (recovering || !pluginAvailable) return;
+    if (!pluginAvailable) return;
+    if (recovering) {
+        // A popup is open or a check is running; look again once it's done so nothing that finished meanwhile is missed.
+        recheckRequested = true;
+        return;
+    }
     recovering = true;
     try {
         const context = SillyTavern.getContext();
@@ -613,10 +689,16 @@ async function checkForRecoverableJobs() {
             return;
         }
         const chatId = context.getCurrentChatId?.();
-        const jobs = (await response.json())
-            .filter(j => j.done && !j.acked && !j.cancelled && j.meta?.pageId !== PAGE_ID && j.status >= 200 && j.status < 300)
+        const allJobs = await response.json();
+
+        allJobs
+            .filter(j => !j.done && !j.cancelled && !j.acked && isForeignChatJob(j, chatId))
+            .forEach(j => watchForeignJob(j));
+
+        const jobs = allJobs
+            .filter(j => j.done && !j.acked && !j.cancelled && j.status >= 200 && j.status < 300)
             .filter(j => !skippedThisSession.has(j.id))
-            .filter(j => !j.meta?.quiet && j.meta?.chatId && j.meta.chatId === chatId)
+            .filter(j => isForeignChatJob(j, chatId))
             .sort((a, b) => a.createdAt - b.createdAt);
 
         for (const job of jobs) {
@@ -655,10 +737,11 @@ async function checkForRecoverableJobs() {
                     is_system: false,
                     send_date: getMessageTimeStamp(),
                     mes: text,
-                    extra: reasoning ? { reasoning } : {},
+                    extra: { ...(reasoning ? { reasoning } : {}), ...(toRetryInfo(job) ? { resumable_retry: toRetryInfo(job) } : {}) },
                 };
                 context.chat.push(message);
                 context.addOneMessage(message);
+                renderAllRetryLabels();
                 await context.saveChat();
             } else if (result === 2 && canSwipe) {
                 const message = context.chat[context.chat.length - 1];
@@ -669,12 +752,14 @@ async function checkForRecoverableJobs() {
                 }
                 message.swipes.push(text);
                 message.swipe_info = message.swipe_info ?? [];
-                message.swipe_info.push({ send_date: getMessageTimeStamp(), extra: reasoning ? { reasoning } : {} });
+                const swipeExtra = { ...(reasoning ? { reasoning } : {}), ...(toRetryInfo(job) ? { resumable_retry: toRetryInfo(job) } : {}) };
+                message.swipe_info.push({ send_date: getMessageTimeStamp(), extra: swipeExtra });
                 message.swipe_id = message.swipes.length - 1;
                 message.mes = text;
-                message.extra = { ...(message.extra ?? {}), reasoning: reasoning || undefined };
+                message.extra = { ...(message.extra ?? {}), reasoning: reasoning || undefined, resumable_retry: swipeExtra.resumable_retry };
                 await context.saveChat();
                 await context.reloadCurrentChat();
+                renderAllRetryLabels();
             }
 
             await ack();
@@ -683,6 +768,10 @@ async function checkForRecoverableJobs() {
         console.error('[resumable-gen] Recovery check failed', error);
     } finally {
         recovering = false;
+        if (recheckRequested) {
+            recheckRequested = false;
+            setTimeout(checkForRecoverableJobs, 0);
+        }
     }
 }
 
